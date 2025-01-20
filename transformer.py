@@ -1,159 +1,124 @@
 import torch
 import torch.nn as nn
 
-class TransformerNetwork(nn.Module):
-    """Feedforward Transformation Network without Tanh
-    reference: https://arxiv.org/abs/1603.08155 
-    exact architecture: https://cs.stanford.edu/people/jcjohns/papers/fast-style/fast-style-supp.pdf
-    """
-    def __init__(self):
-        super(TransformerNetwork, self).__init__()
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm1 = nn.InstanceNorm2d(channels)
+        self.norm2 = nn.InstanceNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
         
-        # 使用更稳定的权重初始化
-        def init_weights(m):
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # 添加SE注意力模块
+        self.se = SELayer(channels)
         
-        # 添加实例归一化
-        self.ConvBlock = nn.Sequential(
-            ConvLayer(3, 32, 9, 1),
-            nn.InstanceNorm2d(32),
-            nn.ReLU(),
-            ConvLayer(32, 64, 3, 2),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(),
-            ConvLayer(64, 128, 3, 2),
-            nn.InstanceNorm2d(128),
-            nn.ReLU()
-        )
-        
-        # 减少残差块数量，但保持效果
-        self.ResidualBlock = nn.Sequential(
-            ResidualLayer(128, 3),
-            ResidualLayer(128, 3),
-            ResidualLayer(128, 3),
-            ResidualLayer(128, 3),
-            ResidualLayer(128, 3)
-        )
-        
-        # 添加实例归一化
-        self.DeconvBlock = nn.Sequential(
-            DeconvLayer(128, 64, 3, 2, 1),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(),
-            DeconvLayer(64, 32, 3, 2, 1),
-            nn.InstanceNorm2d(32),
-            nn.ReLU(),
-            ConvLayer(32, 3, 9, 1, norm="None"),
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        out = self.se(out)  # 应用SE注意力
+        return out + residual
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
             nn.Sigmoid()
         )
-        
-        # 应用权重初始化
-        self.apply(init_weights)
 
     def forward(self, x):
-        # 保存输入用于残差连接
-        input_x = x
-        
-        x = self.ConvBlock(x)
-        x = self.ResidualBlock(x)
-        x = self.DeconvBlock(x)
-        
-        # 使用残差连接
-        x = x * 0.8 + input_x * 0.2
-        
-        return x
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
-class TransformerNetworkTanh(TransformerNetwork):
-    """A modification of the transformation network that uses Tanh function as output 
-    This follows more closely the architecture outlined in the original paper's supplementary material
-    his model produces darker images and provides retro styling effect
-    Reference: https://cs.stanford.edu/people/jcjohns/papers/fast-style/fast-style-supp.pdf
-    """
-    # override __init__ method
-    def __init__(self, tanh_multiplier=150):
-        super(TransformerNetworkTanh, self).__init__()
-        # Add a Tanh layer before output
-        self.DeconvBlock = nn.Sequential(
-            DeconvLayer(128, 64, 3, 2, 1),
-            nn.ReLU(),
-            DeconvLayer(64, 32, 3, 2, 1),
-            nn.ReLU(),
-            ConvLayer(32, 3, 9, 1, norm="None"),
+class ColorAttention(nn.Module):
+    def __init__(self, channels):
+        super(ColorAttention, self).__init__()
+        self.conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # 获取输入特征图的尺寸
+        b, c, h, w = x.size()
+        
+        # 生成颜色注意力权重
+        attention = self.conv(x)  # [b, c, h, w]
+        attention = self.sigmoid(attention)  # [b, c, h, w]
+        
+        # 直接应用注意力权重
+        return x * attention
+
+class ColorAdjustment(nn.Module):
+    def __init__(self):
+        super(ColorAdjustment, self).__init__()
+        self.conv = nn.Conv2d(3, 3, kernel_size=1)
+        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
+        
+    def forward(self, x, target='green'):
+        # 根据目标颜色调整权重
+        if target == 'green':
+            color_weights = torch.tensor([0.8, 1.2, 0.8]).view(1, 3, 1, 1).to(x.device)
+            self.bias.data = torch.tensor([0.0, 0.1, 0.0]).view(1, 3, 1, 1).to(x.device)
+        
+        x = self.conv(x) * color_weights + self.bias
+        return torch.clamp(x, 0, 1)
+
+class ColorTransformerNetwork(nn.Module):
+    def __init__(self):
+        super(ColorTransformerNetwork, self).__init__()
+        
+        # 编码器
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, padding=3),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 颜色转换模块
+        self.color_transform = nn.Sequential(
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ColorAttention(256)
+        )
+        
+        # 解码器
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(64, 3, kernel_size=7, padding=3),
             nn.Tanh()
         )
-        self.tanh_multiplier = tanh_multiplier
-
-    # Override forward method
+        
+        # 添加全局颜色调整模块
+        self.color_adjust = ColorAdjustment()
+        
     def forward(self, x):
-        return super(TransformerNetworkTanh, self).forward(x) * self.tanh_multiplier
-
-class ConvLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, norm="instance"):
-        super(ConvLayer, self).__init__()
-        # Padding Layers
-        padding_size = kernel_size // 2
-        self.reflection_pad = nn.ReflectionPad2d(padding_size)
-
-        # Convolution Layer
-        self.conv_layer = nn.Conv2d(in_channels, out_channels, kernel_size, stride)
-
-        # Normalization Layers
-        self.norm_type = norm
-        if (norm=="instance"):
-            self.norm_layer = nn.InstanceNorm2d(out_channels, affine=True)
-        elif (norm=="batch"):
-            self.norm_layer = nn.BatchNorm2d(out_channels, affine=True)
-
-    def forward(self, x):
-        x = self.reflection_pad(x)
-        x = self.conv_layer(x)
-        if (self.norm_type=="None"):
-            out = x
-        else:
-            out = self.norm_layer(x)
-        return out
-
-class ResidualLayer(nn.Module):
-    """
-    Deep Residual Learning for Image Recognition
-
-    https://arxiv.org/abs/1512.03385
-    """
-    def __init__(self, channels=128, kernel_size=3):
-        super(ResidualLayer, self).__init__()
-        self.conv1 = ConvLayer(channels, channels, kernel_size, stride=1)
-        self.relu = nn.ReLU()
-        self.conv2 = ConvLayer(channels, channels, kernel_size, stride=1)
-
-    def forward(self, x):
-        identity = x                     # preserve residual
-        out = self.relu(self.conv1(x))   # 1st conv layer + activation
-        out = self.conv2(out)            # 2nd conv layer
-        out = out + identity             # add residual
-        return out
-
-class DeconvLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, output_padding, norm="instance"):
-        super(DeconvLayer, self).__init__()
-
-        # Transposed Convolution 
-        padding_size = kernel_size // 2
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding_size, output_padding)
-
-        # Normalization Layers
-        self.norm_type = norm
-        if (norm=="instance"):
-            self.norm_layer = nn.InstanceNorm2d(out_channels, affine=True)
-        elif (norm=="batch"):
-            self.norm_layer = nn.BatchNorm2d(out_channels, affine=True)
-
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        if (self.norm_type=="None"):
-            out = x
-        else:
-            out = self.norm_layer(x)
+        enc = self.encoder(x)
+        trans = self.color_transform(enc)
+        dec = self.decoder(trans)
+        out = self.color_adjust(dec, target='green')
         return out

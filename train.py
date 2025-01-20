@@ -7,18 +7,27 @@ from PIL import Image
 import os
 import random
 import utils
-from transformer import TransformerNetwork
+from transformer import ColorTransformerNetwork
 from vgg import VGG16
 
 # 修改配置参数
 TRAIN_IMAGE_SIZE = 256
-DATASET_PATH = "VOCdevkit/trainB"
-CONTENT_PATH = "VOCdevkit/trainA"
-NUM_EPOCHS = 8        # 增加训练轮数
-BATCH_SIZE = 8
-CONTENT_WEIGHT = 0.8    # 降低内容权重
-STYLE_WEIGHT = 5e5      # 显著增加风格权重
-ADAM_LR = 2e-4         # 增大学习率
+DATASET_PATH = "VOCdevkit/trainB"  # 源域（绿色风格）
+CONTENT_PATH = "VOCdevkit/trainA"  # 目标域（蓝色图像）
+NUM_EPOCHS = 20  # 增加训练轮数
+BATCH_SIZE = 16  # 4090显存充足，可以增加批量大小
+CONTENT_WEIGHT = 2.0       # 保持内容权重
+STYLE_WEIGHT = 5e1         # 进一步降低风格权重
+COLOR_WEIGHT = 2.0         # 调整颜色权重
+TARGET_GREEN = 0.6         # 目标绿色通道值
+TARGET_RED = 0.4          # 目标红色通道值
+TARGET_BLUE = 0.4         # 目标蓝色通道值
+ADAM_LR = 1e-4            # 提高学习率
+
+# 添加颜色转换相关的权重
+BLUE_TO_GREEN_WEIGHT = 10.0  # 蓝到绿的转换权重
+COLOR_PRESERVE_WEIGHT = 0.5  # 其他颜色保持权重
+
 SAVE_MODEL_PATH = "models/"
 SAVE_IMAGE_PATH = "images/out/"
 SAVE_MODEL_EVERY = 20
@@ -59,15 +68,15 @@ def main():
     os.makedirs(SAVE_IMAGE_PATH, exist_ok=True)
     
     # 加载网络
-    transformer = TransformerNetwork().to(device)
+    transformer = ColorTransformerNetwork().to(device)
     vgg = VGG16().to(device)
     
     # 优化器和学习率调度器
     optimizer = optim.Adam(transformer.parameters(), lr=ADAM_LR, betas=(0.5, 0.999))
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[3, 5, 7],  # 在这些epoch降低学习率
-        gamma=0.7              # 更大的学习率下降幅度
+        milestones=[8, 12],
+        gamma=0.85
     )
     
     # 数据加载器
@@ -81,77 +90,157 @@ def main():
     print("开始训练...")
     best_loss = float('inf')
     
-    for epoch in range(NUM_EPOCHS):
-        epoch_loss = 0
-        transformer.train()
+    def style_loss_fn(features, style_features, style_weights=None):
+        if style_weights is None:
+            # 为不同层设置不同的权重
+            style_weights = {
+                'relu1_2': 1.0,
+                'relu2_2': 1.0,
+                'relu3_3': 1.0,
+                'relu4_3': 1.0
+            }
         
-        # 风格权重随训练进行而增加
-        current_style_weight = STYLE_WEIGHT * (1 + epoch * 0.3)  # 增加权重增长率
+        style_loss = 0
+        for key in style_features.keys():
+            if key in style_weights:
+                # 计算 Gram 矩阵
+                g1 = utils.gram(features[key])
+                g2 = utils.gram(style_features[key])
+                style_loss += style_weights[key] * nn.MSELoss()(g1, g2)
+        return style_loss
+    
+    def color_transfer_loss(source, target, content):
+        # 分离RGB通道
+        s_r, s_g, s_b = torch.split(source, 1, dim=1)
+        t_r, t_g, t_b = torch.split(target, 1, dim=1)
+        
+        # 计算目标颜色分布
+        target_r_mean = torch.mean(t_r)
+        target_g_mean = torch.mean(t_g)
+        target_b_mean = torch.mean(t_b)
+        
+        # 颜色目标损失
+        color_target_loss = (
+            torch.abs(torch.mean(s_r) - TARGET_RED) +
+            torch.abs(torch.mean(s_g) - TARGET_GREEN) +
+            torch.abs(torch.mean(s_b) - TARGET_BLUE)
+        ) * 2.0
+        
+        # 颜色比例损失
+        color_ratio_loss = (
+            torch.abs(torch.mean(s_g) / (torch.mean(s_r) + 1e-6) - 1.5) +  # 绿色应该比红色多50%
+            torch.abs(torch.mean(s_g) / (torch.mean(s_b) + 1e-6) - 1.5)    # 绿色应该比蓝色多50%
+        ) * 1.5
+        
+        # 亮度和对比度损失
+        brightness_loss = torch.abs(
+            torch.mean(source) - 0.5  # 保持适中的亮度
+        ) * 2.0
+        
+        contrast_loss = torch.abs(
+            torch.std(source) - torch.std(content)  # 保持原始对比度
+        ) * 2.0
+        
+        # 内容保留损失
+        content_preserve = torch.mean(torch.abs(source - content)) * 2.0
+        
+        # 值域约束
+        value_range_loss = (
+            torch.mean(torch.relu(0.2 - source)) +  # 最小值不低于0.2
+            torch.mean(torch.relu(source - 0.8))    # 最大值不超过0.8
+        ) * 3.0
+        
+        # 局部结构保留
+        def local_structure(x, kernel_size=3):
+            pool = nn.AvgPool2d(kernel_size, stride=1, padding=kernel_size//2)
+            return pool(x)
+        
+        structure_loss = torch.mean(torch.abs(
+            local_structure(source) - local_structure(content)
+        )) * 2.0
+        
+        # 组合损失
+        total_structure_loss = (
+            content_preserve +
+            structure_loss +
+            brightness_loss +
+            contrast_loss +
+            value_range_loss
+        )
+        
+        total_color_loss = color_target_loss + color_ratio_loss
+        
+        return total_structure_loss, total_color_loss
+    
+    for epoch in range(NUM_EPOCHS):
+        transformer.train()
+        epoch_loss = 0.0  # 初始化epoch损失
         
         for batch_id, (content_batch, style_batch) in enumerate(dataloader):
             content_batch = content_batch.to(device)
             style_batch = style_batch.to(device)
             
-            # 检查输入值范围
-            if batch_id == 0:
-                print(f"Content batch range: {content_batch.min():.2f} to {content_batch.max():.2f}")
-                print(f"Style batch range: {style_batch.min():.2f} to {style_batch.max():.2f}")
-            
-            # 生成图像
+            # 生成图像并确保值域
             generated_batch = transformer(content_batch)
+            generated_batch = torch.clamp(generated_batch, 0.2, 0.8)
             
-            # 计算特征
+            # 提取特征
             content_features = vgg(content_batch)
             style_features = vgg(style_batch)
             generated_features = vgg(generated_batch)
             
-            # 内容损失
-            content_loss = CONTENT_WEIGHT * nn.MSELoss()(
-                generated_features['relu2_2'], 
-                content_features['relu2_2']
+            # 计算内容损失 (确保是标量)
+            content_loss = CONTENT_WEIGHT * torch.mean(
+                nn.MSELoss()(
+                    generated_features['relu2_2'],
+                    content_features['relu2_2']
+                )
             )
             
-            # 风格损失
+            # 计算风格损失 (确保是标量)
             style_loss = 0
             for key in style_features.keys():
-                style_loss += nn.MSELoss()(
+                style_loss += torch.mean(nn.MSELoss()(
                     utils.gram(generated_features[key]),
                     utils.gram(style_features[key])
-                )
+                ))
+            style_loss = style_loss * STYLE_WEIGHT
             
-            # 计算损失时使用更激进的权重
+            # 计算损失
             content_loss = content_loss * CONTENT_WEIGHT
-            style_loss = style_loss * current_style_weight
+            style_loss = style_loss * STYLE_WEIGHT
+            structure_loss, color_loss = color_transfer_loss(
+                generated_batch, style_batch, content_batch
+            )
             
-            # 确保style loss不会太小
-            if style_loss.item() < content_loss.item() * 10:
-                style_loss = style_loss * 1.5
-                
-            total_loss = content_loss + style_loss
+            # 动态调整权重
+            if epoch < NUM_EPOCHS // 3:
+                # 前期更注重内容保留
+                color_loss = color_loss * 0.5
+            elif epoch > NUM_EPOCHS * 2 // 3:
+                # 后期加强颜色转换
+                color_loss = color_loss * 1.2
             
-            # 检查损失值
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print("警告：检测到无效损失值，跳过此批次")
-                continue
-                
-            epoch_loss += total_loss.item()
+            total_loss = content_loss + style_loss + structure_loss + color_loss
             
             # 反向传播
             optimizer.zero_grad()
             total_loss.backward()
-            
-            # 使用梯度裁剪
             torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
-            
             optimizer.step()
             
-            # 打印详细的损失信息
+            # 累积epoch损失
+            epoch_loss += total_loss.item()
+            
+            # 打印详细信息
             if batch_id % 5 == 0:
-                print(f"Epoch: {epoch+1}/{NUM_EPOCHS} "
-                      f"Batch: {batch_id}/{len(dataloader)} "
-                      f"Total Loss: {total_loss.item():.4f} "
-                      f"Content Loss: {content_loss.item():.4f} "
-                      f"Style Loss: {style_loss.item():.4f}")
+                r, g, b = torch.split(generated_batch, 1, dim=1)
+                print(f"Epoch: {epoch+1}/{NUM_EPOCHS} Batch: {batch_id}/{len(dataloader)}")
+                print(f"R mean: {torch.mean(r):.4f}, G mean: {torch.mean(g):.4f}, B mean: {torch.mean(b):.4f}")
+                print(f"G/R ratio: {torch.mean(g)/torch.mean(r):.4f}, G/B ratio: {torch.mean(g)/torch.mean(b):.4f}")
+                print(f"Value range: {torch.min(generated_batch):.4f} to {torch.max(generated_batch):.4f}")
+                print(f"Losses - Total: {total_loss.item():.4f}, Content: {content_loss.item():.4f}, "
+                      f"Style: {style_loss.item():.4f}, Color: {color_loss.item():.4f}\n")
             
             # 保存模型和示例图片
             if batch_id % SAVE_MODEL_EVERY == 0:
