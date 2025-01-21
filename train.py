@@ -9,20 +9,22 @@ import random
 import utils
 from transformer import ColorTransformerNetwork
 from vgg import VGG16
+import time
+import numpy as np
 
 # 修改配置参数
 TRAIN_IMAGE_SIZE = 256
 DATASET_PATH = "VOCdevkit/trainB"  # 源域（绿色风格）
 CONTENT_PATH = "VOCdevkit/trainA"  # 目标域（蓝色图像）
-NUM_EPOCHS = 20  # 增加训练轮数
-BATCH_SIZE = 16  # 4090显存充足，可以增加批量大小
-CONTENT_WEIGHT = 2.0       # 保持内容权重
-STYLE_WEIGHT = 5e1         # 进一步降低风格权重
-COLOR_WEIGHT = 2.0         # 调整颜色权重
-TARGET_GREEN = 0.6         # 目标绿色通道值
-TARGET_RED = 0.4          # 目标红色通道值
-TARGET_BLUE = 0.4         # 目标蓝色通道值
-ADAM_LR = 1e-4            # 提高学习率
+NUM_EPOCHS = 20
+BATCH_SIZE = 16
+CONTENT_WEIGHT = 10.0   # 增加内容权重
+STYLE_WEIGHT = 5.5      # 降低风格权重
+COLOR_WEIGHT = 3.0      # 增加颜色权重
+TARGET_GREEN = 0.60     # 固定目标绿色通道值
+TARGET_RED = 0.42       # 固定目标红色通道值
+TARGET_BLUE = 0.35      # 固定目标蓝色通道值
+ADAM_LR = 2e-5         # 降低学习率
 
 # 添加颜色转换相关的权重
 BLUE_TO_GREEN_WEIGHT = 10.0  # 蓝到绿的转换权重
@@ -59,6 +61,34 @@ class StyleContentDataset(data.Dataset):
         
         return content_tensor, style_tensor
 
+def load_reference_model(model_path):
+    """加载参考模型的颜色转换参数"""
+    if os.path.exists(model_path):
+        state = torch.load(model_path)
+        if isinstance(state, dict):
+            if 'model_state' in state:
+                # 新格式
+                model_state = state['model_state']
+            else:
+                # 旧格式
+                model_state = state
+                
+            # 提取颜色转换参数
+            color_weights = None
+            color_bias = None
+            for key, value in model_state.items():
+                if 'color_adjust.conv.weight' in key:
+                    color_weights = value
+                elif 'color_adjust.bias' in key:
+                    color_bias = value
+            
+            if color_weights is not None and color_bias is not None:
+                print("成功加载参考模型的颜色转换参数")
+                return color_weights, color_bias
+    
+    print("未找到参考模型或参数")
+    return None, None
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
@@ -67,8 +97,28 @@ def main():
     os.makedirs(SAVE_MODEL_PATH, exist_ok=True)
     os.makedirs(SAVE_IMAGE_PATH, exist_ok=True)
     
-    # 加载网络
-    transformer = ColorTransformerNetwork().to(device)
+    # 加载参考模型的颜色参数
+    REFERENCE_MODEL_PATH = "transformer_best.pth"  # 替换为您的好模型路径
+    ref_weights, ref_bias = load_reference_model(REFERENCE_MODEL_PATH)
+    
+    # 设置随机种子确保可重复性
+    RANDOM_SEED = 41       # 固定随机种子
+
+    # 设置固定的随机种子
+    torch.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    
+    print(f"使用随机种子: {RANDOM_SEED}")
+    
+    # 初始化模型时传入参考参数
+    transformer = ColorTransformerNetwork(
+        reference_weights=ref_weights,
+        reference_bias=ref_bias
+    ).to(device)
     vgg = VGG16().to(device)
     
     # 优化器和学习率调度器
@@ -112,65 +162,27 @@ def main():
     def color_transfer_loss(source, target, content):
         # 分离RGB通道
         s_r, s_g, s_b = torch.split(source, 1, dim=1)
-        t_r, t_g, t_b = torch.split(target, 1, dim=1)
         
-        # 计算目标颜色分布
-        target_r_mean = torch.mean(t_r)
-        target_g_mean = torch.mean(t_g)
-        target_b_mean = torch.mean(t_b)
-        
-        # 颜色目标损失
+        # 使用固定的目标颜色值
         color_target_loss = (
             torch.abs(torch.mean(s_r) - TARGET_RED) +
             torch.abs(torch.mean(s_g) - TARGET_GREEN) +
             torch.abs(torch.mean(s_b) - TARGET_BLUE)
-        ) * 2.0
+        ) * 3.0  # 增加权重
         
-        # 颜色比例损失
+        # 固定的颜色比例约束
         color_ratio_loss = (
-            torch.abs(torch.mean(s_g) / (torch.mean(s_r) + 1e-6) - 1.5) +  # 绿色应该比红色多50%
-            torch.abs(torch.mean(s_g) / (torch.mean(s_b) + 1e-6) - 1.5)    # 绿色应该比蓝色多50%
-        ) * 1.5
-        
-        # 亮度和对比度损失
-        brightness_loss = torch.abs(
-            torch.mean(source) - 0.5  # 保持适中的亮度
+            torch.abs(torch.mean(s_g) / (torch.mean(s_r) + 1e-6) - 1.4) +
+            torch.abs(torch.mean(s_g) / (torch.mean(s_b) + 1e-6) - 1.6)
         ) * 2.0
         
-        contrast_loss = torch.abs(
-            torch.std(source) - torch.std(content)  # 保持原始对比度
-        ) * 2.0
+        # 亮度保持在合理范围
+        brightness_loss = torch.abs(torch.mean(source) - 0.45) * 2.0
         
-        # 内容保留损失
-        content_preserve = torch.mean(torch.abs(source - content)) * 2.0
+        # 对比度保持
+        contrast_loss = torch.abs(torch.std(source) - torch.std(content)) * 2.0
         
-        # 值域约束
-        value_range_loss = (
-            torch.mean(torch.relu(0.2 - source)) +  # 最小值不低于0.2
-            torch.mean(torch.relu(source - 0.8))    # 最大值不超过0.8
-        ) * 3.0
-        
-        # 局部结构保留
-        def local_structure(x, kernel_size=3):
-            pool = nn.AvgPool2d(kernel_size, stride=1, padding=kernel_size//2)
-            return pool(x)
-        
-        structure_loss = torch.mean(torch.abs(
-            local_structure(source) - local_structure(content)
-        )) * 2.0
-        
-        # 组合损失
-        total_structure_loss = (
-            content_preserve +
-            structure_loss +
-            brightness_loss +
-            contrast_loss +
-            value_range_loss
-        )
-        
-        total_color_loss = color_target_loss + color_ratio_loss
-        
-        return total_structure_loss, total_color_loss
+        return color_target_loss + color_ratio_loss + brightness_loss + contrast_loss
     
     for epoch in range(NUM_EPOCHS):
         transformer.train()
@@ -209,19 +221,9 @@ def main():
             # 计算损失
             content_loss = content_loss * CONTENT_WEIGHT
             style_loss = style_loss * STYLE_WEIGHT
-            structure_loss, color_loss = color_transfer_loss(
-                generated_batch, style_batch, content_batch
-            )
+            color_loss = color_transfer_loss(generated_batch, style_batch, content_batch) * COLOR_WEIGHT
             
-            # 动态调整权重
-            if epoch < NUM_EPOCHS // 3:
-                # 前期更注重内容保留
-                color_loss = color_loss * 0.5
-            elif epoch > NUM_EPOCHS * 2 // 3:
-                # 后期加强颜色转换
-                color_loss = color_loss * 1.2
-            
-            total_loss = content_loss + style_loss + structure_loss + color_loss
+            total_loss = content_loss + style_loss + color_loss
             
             # 反向传播
             optimizer.zero_grad()
@@ -257,6 +259,15 @@ def main():
                     print(f"Generated image range: {generated_image.min():.2f} to {generated_image.max():.2f}")
                     utils.saveimg(generated_image, os.path.join(SAVE_IMAGE_PATH, f'sample_epoch_{epoch}_batch_{batch_id}.jpg'))
                 transformer.train()  # 切换回训练模式
+            
+            # 在训练循环中添加颜色参数监控
+            if batch_id % 10 == 0:
+                current_weights = transformer.color_adjust.conv.weight.data
+                weight_diff = torch.abs(current_weights - ref_weights).mean()
+                print(f"\nEpoch {epoch}, Batch {batch_id}")
+                print(f"与参考权重的平均偏差: {weight_diff:.4f}")
+                print("当前颜色转换矩阵:")
+                print(current_weights.cpu().numpy())
         
         # 计算平均损失
         valid_batches = len(dataloader)

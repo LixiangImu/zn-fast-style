@@ -55,70 +55,82 @@ class ColorAttention(nn.Module):
         return x * attention
 
 class ColorAdjustment(nn.Module):
-    def __init__(self):
+    def __init__(self, reference_weights=None, reference_bias=None):
         super(ColorAdjustment, self).__init__()
         self.conv = nn.Conv2d(3, 3, kernel_size=1)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
         
-    def forward(self, x, target='green'):
-        # 根据目标颜色调整权重
-        if target == 'green':
-            color_weights = torch.tensor([0.8, 1.2, 0.8]).view(1, 3, 1, 1).to(x.device)
-            self.bias.data = torch.tensor([0.0, 0.1, 0.0]).view(1, 3, 1, 1).to(x.device)
+        # 保存参考权重和偏置作为类属性
+        self.reference_weights = reference_weights
+        self.reference_bias = reference_bias
         
-        x = self.conv(x) * color_weights + self.bias
-        return torch.clamp(x, 0, 1)
+        # 固定的颜色转换矩阵，专注于蓝到绿的转换
+        init_weights = torch.tensor([
+            [0.85, 0.10, 0.05],  # R通道基本保持
+            [0.15, 0.75, 0.35],  # G通道增强，部分来自B
+            [0.05, 0.10, 0.60]   # B通道降低
+        ]).view(3, 3, 1, 1)
+        
+        self.conv.weight = nn.Parameter(init_weights)  # 使用nn.Parameter包装
+        self.bias.data = torch.tensor([[0.0], [0.15], [-0.15]]).view(1, 3, 1, 1)
+        
+        # 禁用权重和偏置的梯度更新
+        self.conv.weight.requires_grad = False
+        self.bias.requires_grad = False
+    
+    def forward(self, x):
+        # 直接应用颜色转换，不使用constrain_parameters
+        color_adjusted = self.conv(x) + self.bias
+        # 使用固定的混合比例
+        return torch.clamp(0.3 * x + 0.7 * color_adjusted, 0, 1)
 
 class ColorTransformerNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, reference_weights=None, reference_bias=None):
         super(ColorTransformerNetwork, self).__init__()
         
-        # 编码器
+        # 增加初始特征通道数
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, padding=3),
+            nn.Conv2d(3, 32, kernel_size=7, padding=3),
+            nn.InstanceNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(64),
             nn.ReLU(inplace=True),
             
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(128),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.InstanceNorm2d(256),
             nn.ReLU(inplace=True)
         )
         
-        # 颜色转换模块
+        # 减少ResidualBlock数量，避免过度变形
         self.color_transform = nn.Sequential(
-            ResidualBlock(256),
-            ResidualBlock(256),
-            ResidualBlock(256),
-            ResidualBlock(256),
-            ResidualBlock(256),
-            ResidualBlock(256),
-            ColorAttention(256)
+            ResidualBlock(128),
+            ResidualBlock(128),
+            ResidualBlock(128),
+            ColorAttention(128)
         )
         
-        # 解码器
+        # 解码器对应修改
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(128),
-            nn.ReLU(inplace=True),
-            
             nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.InstanceNorm2d(64),
             nn.ReLU(inplace=True),
             
-            nn.Conv2d(64, 3, kernel_size=7, padding=3),
-            nn.Tanh()
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(32, 3, kernel_size=7, padding=3),
+            nn.Sigmoid()  # 改用Sigmoid替代Tanh
         )
         
-        # 添加全局颜色调整模块
-        self.color_adjust = ColorAdjustment()
+        self.color_adjust = ColorAdjustment(reference_weights, reference_bias)
         
     def forward(self, x):
+        # 添加全局残差连接
         enc = self.encoder(x)
         trans = self.color_transform(enc)
         dec = self.decoder(trans)
-        out = self.color_adjust(dec, target='green')
+        out = self.color_adjust(dec)
         return out

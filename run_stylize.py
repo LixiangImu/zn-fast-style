@@ -30,9 +30,9 @@ def save_image(tensor, save_path):
 def main():
     # 配置参数
     LOAD_SIZE = 256
-    MODEL_PATH = "models/transformer_best.pth"  # 训练好的模型文件路径
-    INPUT_DIR = "VOCdevkit/trainA"  # trainA数据集路径
-    OUTPUT_DIR = "VOCdevkit/trainA_converted"  # 转换后的图像保存路径
+    MODEL_PATH = "models/transformer_best.pth"  # 使用训练好的最佳模型
+    INPUT_DIR = "VOCdevkit/trainA"  # 蓝色图像输入
+    OUTPUT_DIR = "VOCdevkit/trainA_converted"  # 转换后的绿色风格图像输出
     
     # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)

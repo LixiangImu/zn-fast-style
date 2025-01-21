@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from torchvision import transforms, datasets
+from torchvision.utils import save_image as tv_save_image
 
 # Gram Matrix
 def gram(tensor):
@@ -126,3 +127,20 @@ class ImageFolderWithPaths(datasets.ImageFolder):
         # make a new tuple that includes original and the path
         tuple_with_path = (*original_tuple, path)
         return tuple_with_path
+
+def save_image(tensor, path, normalize=True):
+    """保存图像张量到文件
+    
+    Args:
+        tensor (torch.Tensor): 图像张量 [B, C, H, W]
+        path (str): 保存路径
+        normalize (bool): 是否归一化到[0,1]
+    """
+    # 使用 torchvision 的 save_image
+    tv_save_image(tensor, path, normalize=normalize)
+
+def normalize_batch(batch):
+    """归一化批次数据"""
+    mean = batch.new_tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
+    std = batch.new_tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
+    return (batch - mean) / std
