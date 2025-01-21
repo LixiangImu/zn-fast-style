@@ -1,5 +1,5 @@
 评估结果:
-Precision: 0.4750
-Recall: 0.5757
-F1 Score: 0.5119
-Mean IoU: 0.3530
+Precision: 0.8635
+Recall: 0.8689
+F1 Score: 0.8647
+Mean IoU: 0.6236
