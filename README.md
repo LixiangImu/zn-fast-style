@@ -209,3 +209,8 @@ This implementation borrowed some implementation details from:
 ## License
 
 Copyright (c) 2018 Rusty Mina. Free for academic or research use, as long as proper attribution is given and this copyright notice is retained.
+
+# zn-command
+python train.py
+python run_stylize.py
+python evaluate.py
